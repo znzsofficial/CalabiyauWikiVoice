@@ -88,4 +88,3 @@ Possible areas for contribution:
 *   [OkHttp](https://square.github.io/okhttp/): 用于执行 HTTP 网络请求。
 *   [Kotlin Coroutines](https://kotlinlang.org/docs/coroutines-overview.html): 用于实现并发下载。
 *   [卡拉彼丘 Wiki](https://wiki.biligame.com/klbq/): 提供语音数据来源。
-```

@@ -20,9 +20,9 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.cancellation.CancellationException
 
-const val TARGET_URL = "https://wiki.biligame.com/klbq/%E5%BF%A7%E9%9B%BE" // 忧雾
+//const val TARGET_URL = "https://wiki.biligame.com/klbq/%E5%BF%A7%E9%9B%BE" // 忧雾
 
-//const val TARGET_URL = "https://wiki.biligame.com/klbq/%E6%98%9F%E7%BB%98" // 星绘
+const val TARGET_URL = "https://wiki.biligame.com/klbq/%E6%98%9F%E7%BB%98" // 星绘
 const val SAVE_DIR = "E:/角色语音/"  // Windows 保存路径
 const val CLEAR_DIR = true // 是否清除输出文件夹
 const val DOWNLOAD_LANGUAGE = "CN" // 修改这里来选择语言 CN EN JP
@@ -283,13 +283,13 @@ fun sanitizeFileName(name: String): String {
         // 去除首尾的空格
         .trim()
     // 如果清理后字符串为空，则返回一个默认名称，防止创建无名文件
-    return sanitized.ifEmpty { "default_filename" }
+    return sanitized.ifEmpty { "unnamed" }
 }
 
 fun File.clearAll(): Boolean {
     if (!exists()) return true
     if (!isDirectory) return false
-    // 遍历目录下的所有文件和子目录
+    // 遍历目录下的所有文件
     listFiles()?.forEach { it.delete() }
     return true
 }
