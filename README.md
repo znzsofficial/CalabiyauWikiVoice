@@ -4,6 +4,9 @@
 
 This is a tool written in Kotlin for batch downloading character voice lines from the Calabiyau(Strinova) Wiki (wiki.biligame.com/klbq/).
 
+* **想直接用的点这里下载**
+https://github.com/znzsofficial/CalabiYauVoice_GUI/releases/tag/v1.0.0
+
 ## ✨ 功能 (Features)
 
 *   **批量下载**: 输入角色 Wiki 页面的 URL，即可下载该页面上所有的语音文件。
