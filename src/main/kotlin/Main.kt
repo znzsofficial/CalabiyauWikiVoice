@@ -1,295 +1,259 @@
 package com.nekolaska
 
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.joinAll
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import org.jsoup.Jsoup
-import org.jsoup.nodes.Element
 import java.io.File
-import java.io.IOException
-import java.util.concurrent.ConcurrentHashMap
+import java.net.URLEncoder
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.Collections
+import java.util.Scanner
 import java.util.concurrent.atomic.AtomicInteger
-import kotlin.coroutines.cancellation.CancellationException
 
-//const val TARGET_URL = "https://wiki.biligame.com/klbq/%E5%BF%A7%E9%9B%BE" // 忧雾
+// === 配置区域 ===
+const val API_BASE_URL = "https://wiki.biligame.com/klbq/api.php"
+const val SAVE_ROOT_DIR = "E:/角色语音/"
+const val MAX_CONCURRENT_DOWNLOADS = 16
 
-const val TARGET_URL = "https://wiki.biligame.com/klbq/%E6%98%9F%E7%BB%98" // 星绘
-const val SAVE_DIR = "E:/角色语音/"  // Windows 保存路径
-const val CLEAR_DIR = true // 是否清除输出文件夹
-const val DOWNLOAD_LANGUAGE = "CN" // 修改这里来选择语言 CN EN JP
-const val MAX_CONCURRENT_DOWNLOADS = 10 // 同时进行的最大下载数
-val client = OkHttpClient()
+// === 工具 ===
+val client = OkHttpClient.Builder()
+    .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+    .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+    .build()
 
+val jsonParser = Json { ignoreUnknownKeys = true; coerceInputValues = true }
+
+// === 数据结构 ===
+data class CharacterGroup(
+    val characterName: String,     // 角色名 "香奈美"
+    val rootCategory: String,      // 主分类 "Category:香奈美语音"
+    val subCategories: List<String> // ["Category:香奈美语音", "Category:香奈美个人剧情语音"...]
+)
+
+// === API 模型 ===
+@Serializable data class WikiResponse(val query: WikiQuery? = null, @SerialName("continue") val continuation: Map<String, String>? = null)
+@Serializable data class WikiQuery(val search: List<SearchItem>? = null, val categorymembers: List<CategoryMember>? = null, val pages: Map<String, WikiPage>? = null)
+@Serializable data class SearchItem(val title: String)
+@Serializable data class CategoryMember(val ns: Int, val title: String)
+@Serializable data class WikiPage(val title: String, val imageinfo: List<ImageInfo>? = null)
+@Serializable data class ImageInfo(val url: String? = null, val mime: String? = null)
 
 fun main(): Unit = runBlocking {
-    val saveDirFile = File(SAVE_DIR)
-    // 如果设置了 CLEAR_DIR，则清空目录
-    if (CLEAR_DIR) {
-        println("正在清空目录: ${saveDirFile.absolutePath}")
-        if (saveDirFile.clearAll()) println("目录已清空。")
-        else println("[警告] 清空目录失败: ${saveDirFile.absolutePath}")
-    }
-    // 检查并创建保存目录
-    if (!saveDirFile.exists()) {
-        if (saveDirFile.mkdirs()) {
-            println("已创建保存目录: ${saveDirFile.absolutePath}")
-        } else {
-            println("[错误] 无法创建保存目录: ${saveDirFile.absolutePath}，请检查权限或路径。")
-            return@runBlocking // 无法创建目录则退出
-        }
-    } else {
-        println("找到保存目录: ${saveDirFile.absolutePath}")
+    val scanner = Scanner(System.`in`)
+
+    println("正在连接 Wiki 获取语音分类列表...")
+
+    // 1. 获取并清洗列表
+    val rawList = searchCategories("语音")
+    val validList = rawList.filter { it.endsWith("语音") }
+
+    if (validList.isEmpty()) {
+        println("未找到分类。")
+        return@runBlocking
     }
 
-    println("开始从 $TARGET_URL 获取 HTML 内容...")
-    fetchHtml(TARGET_URL)?.let {
-        println("HTML 获取成功，将下载语言: $DOWNLOAD_LANGUAGE (最多 $MAX_CONCURRENT_DOWNLOADS 个并发)...")
-        parseAndDownload(it)
-        println("\n所有下载任务已启动并等待完成...")
-    } ?: println("[错误] 未能从 $TARGET_URL 获取 HTML 内容。")
-    println("处理完成。")
-}
+    // 2. 智能分组
+    val groups = groupCategories(validList)
 
-/**
- * 根据指定的语言和 HTML 结构查找对应的 MP3 链接。
- * @param td 包含 rowspan 的那个 <td> 元素。
- * @param language 要查找的语言 ("CN", "JP", "EN")。
- * @return 找到的绝对 URL 字符串，如果找不到或不支持则返回 null。
- */
-fun findMp3Url(td: Element, language: String): String? {
-    val parentRow = td.parent() ?: return null // 获取包含 td 的行 <tr>
-    val rowspan = td.attr("rowspan").toIntOrNull() // 获取 rowspan 值
+    // 3. 显示角色列表 (一级菜单)
+    println("\n=== 角色列表 ===")
+    groups.forEachIndexed { index, group ->
+        val countInfo = if (group.subCategories.size > 1) "含 ${group.subCategories.size} 个子项" else "单项"
+        println(String.format("[%2d] %-12s (%s)", index + 1, group.characterName, countInfo))
+    }
 
-    return when (language.uppercase()) { // 统一转大写处理
-        "CN" -> {
-            // 中文总是在 rowspan 元素所在行的第二个 td (td:eq(1))
-            parentRow.select("td:eq(1) a[href]").firstOrNull()?.attr("abs:href")
-        }
+    println("\n请输入序号 (多选: 1,3  全选: A  退出: Q): ")
+    val input = scanner.nextLine().trim()
+    val selectedGroups = parseGroupSelection(input, groups)
 
-        "JP" -> {
-            // 日语总是在下一行的第一个 td (td:eq(0))，对 rowspan=2 和 3 都适用
-            parentRow.nextElementSibling() // 获取下一个兄弟元素 <tr>
-                ?.select("td:eq(0) a[href]")?.firstOrNull()?.attr("abs:href")
-        }
+    if (selectedGroups.isEmpty()) return@runBlocking
 
-        "EN" -> {
-            // 英语只在 rowspan=3 结构中存在，在日文行的下一行的第一个 td (td:eq(0))
-            if (rowspan == 3) {
-                parentRow.nextElementSibling() // 日文行 <tr>
-                    ?.nextElementSibling() // 英文行 <tr>
-                    ?.select("td:eq(0) a[href]")?.firstOrNull()?.attr("abs:href")
+    // 4. 处理选中的角色
+    for (group in selectedGroups) {
+        println("\n========================================")
+        println(">>> 正在处理: ${group.characterName}")
+
+        // --- 核心逻辑分支 ---
+        val finalCategories = if (group.subCategories.size > 1) {
+            // 分支 A: 多个分类 -> 进入二级选择
+            println("    该角色包含多个相关分类，请选择要下载的内容:")
+
+            // 排序：把主分类(最短的)放第一位，其他的按名字排序
+            val sortedSubs = group.subCategories.sortedWith(compareBy({ it.length }, { it }))
+
+            sortedSubs.forEachIndexed { idx, cat ->
+                val displayName = cat.replace("Category:", "").replace("分类:", "")
+                // 标记主分类
+                val mark = if (cat == group.rootCategory) " (★主分类)" else ""
+                println(String.format("    [%2d] %s%s", idx + 1, displayName, mark))
+            }
+
+            println("\n    [A] 全选 (默认)  [序号] 只选指定 (如 1,3)  [S] 跳过此角色")
+            print("    请输入: ")
+            val subInput = scanner.nextLine().trim()
+
+            if (subInput.equals("S", true)) {
+                println("    已跳过。")
+                emptyList()
             } else {
-                null // rowspan=2 没有英文
+                parseStringSelection(subInput, sortedSubs)
             }
-        }
-
-        else -> null // 不支持的语言
-    }
-}
-
-
-/**
- * 解析 HTML 内容，根据 DOWNLOAD_LANGUAGE 常量并发下载指定语言的语音。
- * @param html 待解析的 HTML 字符串
- */
-suspend fun parseAndDownload(html: String) = coroutineScope {
-    val doc = Jsoup.parse(html, TARGET_URL) // 提供 baseUri
-    val downloadJobs = mutableListOf<Job>()
-    val downloadSemaphore = Semaphore(MAX_CONCURRENT_DOWNLOADS)
-    val progressCounter = AtomicInteger(0)
-    val nameCounters = ConcurrentHashMap<String, AtomicInteger>()
-    val counterMutexes = ConcurrentHashMap<String, Mutex>()
-
-    // 1. 查找所有可能的条目起始 td
-    val entries = doc.select("td[rowspan='3'], td[rowspan='2']")
-
-    // 2. 预处理：根据选定语言过滤有效任务
-    val validTasks = entries.mapNotNull { td ->
-        val rawName = td.text().trim()
-        if (rawName.isEmpty()) return@mapNotNull null
-
-        val baseName = sanitizeFileName(rawName)
-        // 查找指定语言的链接
-        val mp3Url = findMp3Url(td, DOWNLOAD_LANGUAGE)
-
-        // 如果找到了指定语言的有效链接，则任务有效
-        if (mp3Url != null && mp3Url.isNotBlank() && mp3Url.endsWith(".mp3", ignoreCase = true)) {
-            Triple(baseName, mp3Url, rawName) // (基础名, 找到的MP3链接, 原始名)
         } else {
-            // 如果找不到选定语言的链接，则此条目对于当前任务无效
-            // println("  [跳过] 对于 '$rawName' 未找到有效的 $DOWNLOAD_LANGUAGE 语音链接。")
-            null
+            // 分支 B: 只有一个分类 -> 直接下载，不打扰用户
+            println("    锁定分类: ${group.subCategories.first().replace("Category:", "")}")
+            group.subCategories
         }
-    }
 
-    val totalValidTasks = validTasks.size
-    if (totalValidTasks == 0) {
-        println("未发现任何有效的 $DOWNLOAD_LANGUAGE 语音条目可供下载。")
-        return@coroutineScope
-    }
-    println("发现 $totalValidTasks 个有效的 $DOWNLOAD_LANGUAGE 语音条目，开始下载...")
+        if (finalCategories.isEmpty()) continue
 
-    // 3. 为每个有效任务启动下载协程
-    validTasks.forEach { (baseName, mp3Url, rawName) ->
-        val job = launch(Dispatchers.IO) {
-            var targetFile: File? = null
-            try {
-                // --- 修改点：文件名包含语言后缀 ---
-                val baseNameWithLang = "${baseName}_$DOWNLOAD_LANGUAGE" // 例如 "选择角色_CN"
+        // 5. 执行下载
+        println("    正在扫描音频文件...")
+        val allFiles = fetchAudioFilesFromCategories(finalCategories.toSet())
+        val uniqueFiles = allFiles.distinctBy { it.second } // URL去重
 
-                val nameMutex = counterMutexes.computeIfAbsent(baseNameWithLang) { Mutex() } // 使用带语言的 key
-                val counter = nameCounters.computeIfAbsent(baseNameWithLang) { AtomicInteger(0) } // 使用带语言的 key
+        if (uniqueFiles.isNotEmpty()) {
+            println("    共找到 ${uniqueFiles.size} 个文件，准备下载...")
 
-                val uniqueFileName = nameMutex.withLock {
-                    val index = counter.getAndIncrement()
-                    if (index == 0) {
-                        "$baseNameWithLang.mp3"
-                    } else {
-                        "$baseNameWithLang($index).mp3" // 例如 "选择角色_CN(1).mp3"
+            val saveDir = File(SAVE_ROOT_DIR, sanitizeFileName(group.characterName))
+            if (!saveDir.exists()) saveDir.mkdirs()
+
+            val semaphore = Semaphore(MAX_CONCURRENT_DOWNLOADS)
+            val counter = AtomicInteger(0)
+
+            uniqueFiles.map { (name, url) ->
+                launch(Dispatchers.IO) {
+                    semaphore.acquire()
+                    try {
+                        var safeName = sanitizeFileName(name)
+                        // 补全后缀
+                        if (!safeName.contains(".")) {
+                            if (url.endsWith(".ogg")) safeName += ".ogg"
+                            else if (url.endsWith(".mp3")) safeName += ".mp3"
+                        }
+
+                        downloadFile(url, File(saveDir, safeName))
+
+                        val c = counter.incrementAndGet()
+                        if (c % 10 == 0 || c == uniqueFiles.size) {
+                            print("\r    下载进度: $c / ${uniqueFiles.size}")
+                        }
+                    } finally {
+                        semaphore.release()
                     }
                 }
-                targetFile = File(SAVE_DIR, uniqueFileName)
-
-                // --- 执行下载 ---
-                downloadSemaphore.acquire()
-                try {
-                    downloadFile(mp3Url, targetFile)
-                    val completedCount = progressCounter.incrementAndGet()
-                    print("\r下载进度: $completedCount / $totalValidTasks (${targetFile.name})          ")
-                    if (completedCount == totalValidTasks) {
-                        println()
-                    }
-                } finally {
-                    downloadSemaphore.release()
-                }
-
-            } catch (e: CancellationException) {
-                println("\n[取消] '$rawName' ($DOWNLOAD_LANGUAGE) (${targetFile?.name ?: "未知"}) 的下载任务被取消。")
-                targetFile?.takeIf { it.exists() }?.delete()
-                throw e
-            } catch (e: Exception) {
-                println("\n[错误] 处理 '$rawName' ($DOWNLOAD_LANGUAGE) (${targetFile?.name ?: "未知文件"}) 时发生异常: ${e.message}")
-                targetFile?.takeIf { it.exists() }?.delete()
-            }
+            }.joinAll()
+            println("\n    [完成] ${group.characterName}")
+        } else {
+            println("    [提示] 未找到音频文件。")
         }
-        downloadJobs.add(job)
     }
-
-    // 4. 等待所有下载协程完成
-    downloadJobs.joinAll()
+    println("\n所有任务已结束。")
 }
 
+// === 辅助逻辑 ===
+
 /**
- * 从指定的 URL 下载文件并保存到目标文件。
- * 现在是一个 suspend 函数，以便在协程中调用。
- * @param url 文件的网络地址
- * @param targetFile 要保存到的本地文件对象
+ * 智能分组算法
  */
+fun groupCategories(rawList: List<String>): List<CharacterGroup> {
+    val cleanMap = rawList.associateWith { it.replace(Regex("^(Category:|分类:)"), "") }
+    val sortedItems = cleanMap.entries.sortedBy { it.value.length } // 短名优先，作为 Root 候选
+
+    val groups = mutableListOf<CharacterGroup>()
+    val assigned = mutableSetOf<String>()
+
+    for ((originalName, cleanName) in sortedItems) {
+        if (assigned.contains(originalName)) continue
+
+        val coreName = cleanName.removeSuffix("语音") // 提取 "香奈美"
+        if (coreName.isBlank()) continue
+
+        // 查找家族成员：包含核心词且以语音结尾
+        val familyMembers = rawList.filter { raw ->
+            val cl = cleanMap[raw]!!
+            cl.startsWith(coreName) && cl.endsWith("语音")
+        }
+
+        groups.add(CharacterGroup(coreName, originalName, familyMembers))
+        assigned.addAll(familyMembers)
+    }
+    return groups.sortedBy { it.characterName }
+}
+
+fun parseGroupSelection(input: String, source: List<CharacterGroup>): List<CharacterGroup> {
+    if (input.equals("Q", true)) return emptyList()
+    if (input.equals("A", true) || input.isBlank()) return source
+    val res = mutableListOf<CharacterGroup>()
+    input.split("[,\\s]+".toRegex()).forEach {
+        it.toIntOrNull()?.let { idx -> if (idx in 1..source.size) res.add(source[idx - 1]) }
+    }
+    return res
+}
+
+fun parseStringSelection(input: String, source: List<String>): List<String> {
+    if (input.equals("A", true) || input.isBlank()) return source
+    val res = mutableListOf<String>()
+    input.split("[,\\s]+".toRegex()).forEach {
+        it.toIntOrNull()?.let { idx -> if (idx in 1..source.size) res.add(source[idx - 1]) }
+    }
+    return res
+}
+
+suspend fun searchCategories(keyword: String): List<String> = withContext(Dispatchers.IO) {
+    val encoded = URLEncoder.encode(keyword, "UTF-8")
+    val url = "$API_BASE_URL?action=query&list=search&srsearch=$encoded&srnamespace=14&format=json&srlimit=500"
+    val json = fetchString(url) ?: return@withContext emptyList()
+    try { jsonParser.decodeFromString<WikiResponse>(json).query?.search?.map { it.title } ?: emptyList() } catch (_: Exception) { emptyList() }
+}
+
+suspend fun fetchAudioFilesFromCategories(categories: Set<String>): List<Pair<String, String>> = withContext(Dispatchers.IO) {
+    val results = Collections.synchronizedList(mutableListOf<Pair<String, String>>())
+    categories.map { cat -> async { results.addAll(getCategoryFilesDetail(cat)) } }.awaitAll()
+    results
+}
+
+suspend fun getCategoryFilesDetail(category: String): List<Pair<String, String>> {
+    val list = mutableListOf<Pair<String, String>>()
+    val encoded = URLEncoder.encode(category, "UTF-8")
+    var token: String? = null
+    do {
+        val cArg = if (token != null) "&gcmcontinue=$token" else ""
+        val url = "$API_BASE_URL?action=query&generator=categorymembers&gcmtitle=$encoded&gcmnamespace=6&prop=imageinfo&iiprop=url|mime&format=json&gcmlimit=500$cArg"
+        val json = fetchString(url) ?: break
+        try {
+            val res = jsonParser.decodeFromString<WikiResponse>(json)
+            res.query?.pages?.values?.forEach { p ->
+                val i = p.imageinfo?.firstOrNull()
+                if (i?.url != null && (i.mime?.startsWith("audio/") == true || i.url.endsWith(".ogg") || i.url.endsWith(".mp3"))) {
+                    list.add(p.title.replace(Regex("^(File:|文件:)"), "") to i.url)
+                }
+            }
+            token = res.continuation?.get("gcmcontinue")
+        } catch (_: Exception) { break }
+    } while (token != null)
+    return list
+}
+
+suspend fun fetchString(url: String): String? = withContext(Dispatchers.IO) {
+    try { client.newCall(Request.Builder().url(url).build()).execute().use { if (it.isSuccessful) it.body.string() else null } } catch (_: Exception) { null }
+}
+
 fun downloadFile(url: String, targetFile: File) {
-    // println("  准备下载 (挂起): ${targetFile.name} [源地址: $url]")
-
-    val request = Request.Builder()
-        .url(url)
-        .header("Referer", TARGET_URL)
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36"
-        )
-        .build()
-
+    if (targetFile.exists() && targetFile.length() > 0) return
     try {
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                // 异步环境下的错误日志可能交错，添加文件名帮助识别
-                println("\n[错误] 下载 ${targetFile.name} 失败。服务器响应码: ${response.code}")
-                return // 下载失败
-            }
-
-            response.body?.use { body ->
-                targetFile.outputStream().buffered().use { output ->
-                    body.byteStream().copyTo(output)
-                    // println("  下载成功 (挂起完成): ${targetFile.absolutePath}")
-                }
-            } ?: println("\n[错误] 下载 ${targetFile.name} 失败，响应体为空。")
-
-        }
-    } catch (e: IOException) {
-        println("\n[错误] 下载 ${targetFile.name} 时发生 IO 异常: ${e.message}")
-        if (targetFile.exists()) targetFile.delete()
-    } catch (e: CancellationException) {
-        // 协程被取消时的处理
-        println("\n[取消] 下载 ${targetFile.name} 被取消。")
-        if (targetFile.exists()) targetFile.delete() // 删除部分下载的文件
-        throw e // 重新抛出取消异常很重要
-    } catch (e: Exception) {
-        println("\n[错误] 下载 ${targetFile.name} 时发生未知错误: ${e.message}")
-        if (targetFile.exists()) targetFile.delete()
-    }
-}
-
-/**
- * 获取指定 URL 的 HTML 网页内容。
- * @param url 网页地址
- * @return 获取到的 HTML 字符串，如果失败则返回 null
- */
-suspend fun fetchHtml(url: String): String? = withContext(Dispatchers.IO) {
-    // 将网络请求放在 IO 线程池执行
-    val request = Request.Builder()
-        .url(url)
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36"
-        )
-        .build()
-
-    try {
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                println("[错误] 获取 HTML 失败。URL: $url, 状态码: ${response.code}")
-                null
-            } else {
-                response.body?.string() // 读取响应体
+        client.newCall(Request.Builder().url(url).build()).execute().use { response ->
+            if (response.isSuccessful) {
+                if (!targetFile.parentFile.exists()) targetFile.parentFile.mkdirs()
+                val tmp = File(targetFile.parent, targetFile.name + ".tmp")
+                response.body.byteStream().use { input -> tmp.outputStream().use { output -> input.copyTo(output) } }
+                if (tmp.exists()) Files.move(tmp.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
             }
         }
-    } catch (e: IOException) {
-        println("[错误] 获取 HTML 时发生 IO 异常: ${e.message}")
-        null
-    } catch (e: Exception) {
-        println("[错误] 获取 HTML 时发生未知错误: ${e.message}")
-        null
-    }
+    } catch (_: Exception) { }
 }
-
-/**
- * 清理字符串，使其成为合法的文件名 (主要针对 Windows 系统)。
- * 替换非法字符为下划线，合并多余空格。
- * @param name 原始名称字符串
- * @return 清理后的、适合用作文件名的字符串
- */
-fun sanitizeFileName(name: String): String {
-    // 替换 Windows 文件名中的非法字符: \ / : * ? " < > | 为下划线 "_"
-    val sanitized = name.replace(Regex("[\\\\/:*?\"<>|]"), "_")
-        // 将一个或多个连续的空白字符 (空格, tab, 换行等) 替换为单个空格
-        .replace("\\s+".toRegex(), " ")
-        // 去除首尾的空格
-        .trim()
-    // 如果清理后字符串为空，则返回一个默认名称，防止创建无名文件
-    return sanitized.ifEmpty { "unnamed" }
-}
-
-fun File.clearAll(): Boolean {
-    if (!exists()) return true
-    if (!isDirectory) return false
-    // 遍历目录下的所有文件
-    listFiles()?.forEach { it.delete() }
-    return true
-}
+fun sanitizeFileName(name: String) = name.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
