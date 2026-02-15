@@ -5,15 +5,22 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.JavaNetCookieJar
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
+import java.net.CookieManager
+import java.net.CookiePolicy
 import java.net.URLEncoder
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.Collections
 import java.util.Scanner
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.random.Random
 
 // === 配置区域 ===
 const val API_BASE_URL = "https://wiki.biligame.com/klbq/api.php"
@@ -21,9 +28,59 @@ const val SAVE_ROOT_DIR = "E:/角色语音/"
 const val MAX_CONCURRENT_DOWNLOADS = 16
 
 // === 工具 ===
-val client = OkHttpClient.Builder()
-    .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-    .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+private val USER_AGENTS = listOf(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+)
+
+// 每次启动随机选一个 UA，保持会话期间一致性
+private val currentUA = USER_AGENTS.random()
+
+val client: OkHttpClient = OkHttpClient.Builder()
+    // 自动管理 Cookie
+    .cookieJar(JavaNetCookieJar(CookieManager().apply {
+        setCookiePolicy(CookiePolicy.ACCEPT_ALL)
+    }))
+    // 增加超时时间
+    .connectTimeout(30, TimeUnit.SECONDS)
+    .readTimeout(60, TimeUnit.SECONDS)
+    .writeTimeout(60, TimeUnit.SECONDS)
+    // 3. 核心拦截器：伪装头信息
+    .addInterceptor { chain ->
+        val original = chain.request()
+        val request = original.newBuilder()
+            .header("User-Agent", currentUA)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+            .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+            // 关键：告诉服务器我是从列表页过来的
+            .header("Referer", "https://wiki.biligame.com/klbq/")
+            .header("Connection", "keep-alive")
+            .build()
+        chain.proceed(request)
+    }
+    // 4. 重试拦截器：遇到风控歇一会儿
+    .addInterceptor { chain ->
+        var response = chain.proceed(chain.request())
+        var tryCount = 0
+        val maxLimit = 3
+
+        // 如果遇到 429 (Too Many Requests) 或 503 (Service Unavailable)，尝试重试
+        while (!response.isSuccessful && (response.code == 429 || response.code == 503 || response.code == 403) && tryCount < maxLimit) {
+            tryCount++
+            response.close() // 关闭旧响应
+
+            // 指数退避：第一次歇 2s，第二次歇 4s...
+            val sleepTime = 2000L * tryCount + Random.nextLong(500)
+            println("触发风控 (${response.code})，等待 ${sleepTime}ms 后重试 ($tryCount/$maxLimit)...")
+            Thread.sleep(sleepTime)
+
+            // 重新发起请求
+            response = chain.proceed(chain.request())
+        }
+        response
+    }
     .build()
 
 val jsonParser = Json { ignoreUnknownKeys = true; coerceInputValues = true }
@@ -36,12 +93,26 @@ data class CharacterGroup(
 )
 
 // === API 模型 ===
-@Serializable data class WikiResponse(val query: WikiQuery? = null, @SerialName("continue") val continuation: Map<String, String>? = null)
-@Serializable data class WikiQuery(val search: List<SearchItem>? = null, val categorymembers: List<CategoryMember>? = null, val pages: Map<String, WikiPage>? = null)
-@Serializable data class SearchItem(val title: String)
-@Serializable data class CategoryMember(val ns: Int, val title: String)
-@Serializable data class WikiPage(val title: String, val imageinfo: List<ImageInfo>? = null)
-@Serializable data class ImageInfo(val url: String? = null, val mime: String? = null)
+@Serializable data class WikiResponse(
+    val query: WikiQuery? = null,
+    @SerialName("continue") val continuation: Map<String, JsonElement>? = null
+)
+
+@Serializable
+data class WikiQuery(
+    val search: List<SearchItem>? = null,
+    val categorymembers: List<CategoryMember>? = null,
+    val pages: Map<String, WikiPage>? = null
+)
+
+@Serializable
+data class SearchItem(val title: String)
+@Serializable
+data class CategoryMember(val ns: Int, val title: String)
+@Serializable
+data class WikiPage(val title: String, val imageinfo: List<ImageInfo>? = null)
+@Serializable
+data class ImageInfo(val url: String? = null, val mime: String? = null)
 
 fun main(): Unit = runBlocking {
     val scanner = Scanner(System.`in`)
@@ -208,14 +279,19 @@ suspend fun searchCategories(keyword: String): List<String> = withContext(Dispat
     val encoded = URLEncoder.encode(keyword, "UTF-8")
     val url = "$API_BASE_URL?action=query&list=search&srsearch=$encoded&srnamespace=14&format=json&srlimit=500"
     val json = fetchString(url) ?: return@withContext emptyList()
-    try { jsonParser.decodeFromString<WikiResponse>(json).query?.search?.map { it.title } ?: emptyList() } catch (_: Exception) { emptyList() }
+    try {
+        jsonParser.decodeFromString<WikiResponse>(json).query?.search?.map { it.title } ?: emptyList()
+    } catch (_: Exception) {
+        emptyList()
+    }
 }
 
-suspend fun fetchAudioFilesFromCategories(categories: Set<String>): List<Pair<String, String>> = withContext(Dispatchers.IO) {
-    val results = Collections.synchronizedList(mutableListOf<Pair<String, String>>())
-    categories.map { cat -> async { results.addAll(getCategoryFilesDetail(cat)) } }.awaitAll()
-    results
-}
+suspend fun fetchAudioFilesFromCategories(categories: Set<String>): List<Pair<String, String>> =
+    withContext(Dispatchers.IO) {
+        val results = Collections.synchronizedList(mutableListOf<Pair<String, String>>())
+        categories.map { cat -> async { results.addAll(getCategoryFilesDetail(cat)) } }.awaitAll()
+        results
+    }
 
 suspend fun getCategoryFilesDetail(category: String): List<Pair<String, String>> {
     val list = mutableListOf<Pair<String, String>>()
@@ -223,24 +299,35 @@ suspend fun getCategoryFilesDetail(category: String): List<Pair<String, String>>
     var token: String? = null
     do {
         val cArg = if (token != null) "&gcmcontinue=$token" else ""
-        val url = "$API_BASE_URL?action=query&generator=categorymembers&gcmtitle=$encoded&gcmnamespace=6&prop=imageinfo&iiprop=url|mime&format=json&gcmlimit=500$cArg"
+        val url =
+            "$API_BASE_URL?action=query&generator=categorymembers&gcmtitle=$encoded&gcmnamespace=6&prop=imageinfo&iiprop=url|mime&format=json&gcmlimit=500$cArg"
         val json = fetchString(url) ?: break
         try {
             val res = jsonParser.decodeFromString<WikiResponse>(json)
             res.query?.pages?.values?.forEach { p ->
                 val i = p.imageinfo?.firstOrNull()
-                if (i?.url != null && (i.mime?.startsWith("audio/") == true || i.url.endsWith(".ogg") || i.url.endsWith(".mp3"))) {
+                if (i?.url != null && (i.mime?.startsWith("audio/") == true || i.url.endsWith(".ogg") || i.url.endsWith(
+                        ".mp3"
+                    ))
+                ) {
                     list.add(p.title.replace(Regex("^(File:|文件:)"), "") to i.url)
                 }
             }
-            token = res.continuation?.get("gcmcontinue")
-        } catch (_: Exception) { break }
+            token = res.continuation?.get("cmcontinue")?.jsonPrimitive?.content
+        } catch (_: Exception) {
+            break
+        }
     } while (token != null)
     return list
 }
 
 suspend fun fetchString(url: String): String? = withContext(Dispatchers.IO) {
-    try { client.newCall(Request.Builder().url(url).build()).execute().use { if (it.isSuccessful) it.body.string() else null } } catch (_: Exception) { null }
+    try {
+        client.newCall(Request.Builder().url(url).build()).execute()
+            .use { if (it.isSuccessful) it.body.string() else null }
+    } catch (_: Exception) {
+        null
+    }
 }
 
 fun downloadFile(url: String, targetFile: File) {
@@ -254,6 +341,8 @@ fun downloadFile(url: String, targetFile: File) {
                 if (tmp.exists()) Files.move(tmp.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
             }
         }
-    } catch (_: Exception) { }
+    } catch (_: Exception) {
+    }
 }
+
 fun sanitizeFileName(name: String) = name.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
